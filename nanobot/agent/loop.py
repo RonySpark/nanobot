@@ -173,23 +173,41 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[[str], Awaitable[None]] | None = None,
-    ) -> tuple[str | None, list[str]]:
-        """Run the agent iteration loop. Returns (final_content, tools_used)."""
+        initial_response_id: str | None = None,
+    ) -> tuple[str | None, list[str], str | None]:
+        """Run the agent iteration loop. Returns (final_content, tools_used, final_response_id)."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        current_response_id = initial_response_id
+        # Track how many messages have been sent to the provider (for stateful continuation)
+        sent_boundary = len(initial_messages)
 
         while iteration < self.max_iterations:
             iteration += 1
 
+            # For stateful providers: first call sends full context (or just new user msg if prev_id set).
+            # Subsequent calls within the same turn send only the new tool results.
+            if iteration == 1:
+                call_messages = messages
+            else:
+                # Only send messages appended since the last provider call (tool results)
+                call_messages = messages[sent_boundary:]
+                sent_boundary = len(messages)
+
             response = await self.provider.chat(
-                messages=messages,
+                messages=call_messages,
                 tools=self.tools.get_definitions(),
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
+                previous_response_id=current_response_id,
             )
+
+            # Track response_id for stateful continuation
+            if response.response_id:
+                current_response_id = response.response_id
 
             if response.has_tool_calls:
                 if on_progress:
@@ -227,7 +245,7 @@ class AgentLoop:
                 final_content = self._strip_think(response.content)
                 break
 
-        return final_content, tools_used
+        return final_content, tools_used, current_response_id
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -304,7 +322,11 @@ class AgentLoop:
                 history=session.get_history(max_messages=self.memory_window),
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _ = await self._run_agent_loop(messages)
+            final_content, _, final_response_id = await self._run_agent_loop(
+                messages, initial_response_id=session.metadata.get("last_response_id"),
+            )
+            if final_response_id:
+                session.metadata["last_response_id"] = final_response_id
             session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
             session.add_message("assistant", final_content or "Background task completed.")
             self.sessions.save(session)
@@ -389,12 +411,18 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, tools_used = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+        final_content, tools_used, final_response_id = await self._run_agent_loop(
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            initial_response_id=session.metadata.get("last_response_id"),
         )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
+
+        # Persist response_id for stateful continuation on next turn
+        if final_response_id:
+            session.metadata["last_response_id"] = final_response_id
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
