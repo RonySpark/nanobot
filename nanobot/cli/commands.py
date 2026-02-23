@@ -295,11 +295,13 @@ def _make_provider(config: Config):
 
     # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
     if provider_name == "custom":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-        )
+        api_base = config.get_api_base(model) or "http://localhost:8000/v1"
+        api_key = p.api_key if p else "no-key"
+        # Auto-upgrade to native Responses API when pointing at xAI
+        if "api.x.ai" in api_base:
+            from nanobot.providers.xai_responses_provider import XAIResponsesProvider
+            return XAIResponsesProvider(api_key=api_key, default_model=model)
+        return CustomProvider(api_key=api_key, api_base=api_base, default_model=model)
 
     from nanobot.providers.registry import find_by_name
     spec = find_by_name(provider_name)
