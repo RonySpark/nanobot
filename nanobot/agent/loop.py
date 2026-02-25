@@ -30,6 +30,10 @@ if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig
     from nanobot.cron.service import CronService
 
+# Tools that change persistent state — require post-execution verification hint
+# so the model cannot claim success without quoting the raw result.
+STATE_CHANGING_TOOLS = {"write_file", "edit_file", "exec", "cron", "spawn"}
+
 
 class AgentLoop:
     """
@@ -238,6 +242,17 @@ class AgentLoop:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    # Post-tool verification: for state-changing tools, append a
+                    # verification mandate so the model must quote the raw result
+                    # before claiming success (closes honour-system hallucination gap).
+                    if tool_call.name in STATE_CHANGING_TOOLS:
+                        result = (
+                            f"{result}\n\n"
+                            "[VERIFY] State-changing tool executed. "
+                            "You MUST quote this exact result verbatim in your response "
+                            "before any 'done' or success statement. "
+                            "Do not summarise, paraphrase, or assume success."
+                        )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -403,6 +418,8 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
         )
+        # Capture boundary so we can extract tool calls + results added during the loop
+        pre_loop_length = len(initial_messages)
 
         async def _bus_progress(content: str) -> None:
             meta = dict(msg.metadata or {})
@@ -428,6 +445,24 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         session.add_message("user", msg.content)
+        # Persist the full tool call chain: assistant-with-tool_calls + tool results.
+        # initial_messages is mutated in-place by _run_agent_loop; new entries start
+        # at pre_loop_length (the user message was already part of initial_messages).
+        for tmsg in initial_messages[pre_loop_length:]:
+            role = tmsg.get("role")
+            if role == "assistant":
+                kw: dict[str, Any] = {}
+                if tmsg.get("tool_calls"):
+                    kw["tool_calls"] = tmsg["tool_calls"]
+                if tmsg.get("reasoning_content"):
+                    kw["reasoning_content"] = tmsg["reasoning_content"]
+                session.add_message("assistant", tmsg.get("content") or "", **kw)
+            elif role == "tool":
+                session.add_message(
+                    "tool", tmsg.get("content") or "",
+                    tool_call_id=tmsg.get("tool_call_id"),
+                    name=tmsg.get("name"),
+                )
         session.add_message("assistant", final_content,
                             tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
