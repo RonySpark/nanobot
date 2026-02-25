@@ -173,6 +173,100 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    async def _log_escalation(
+        self,
+        payload: dict[str, Any],
+        channel: str = "unknown",
+        chat_id: str = "unknown",
+    ) -> None:
+        """Append escalation event to ESCALATION-LOG.md for tracking."""
+        from datetime import datetime
+        log_path = self.workspace / "memory" / "ESCALATION-LOG.md"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S ACST")
+        attempts = payload.get("attempts", "?")
+        task = payload.get("task", "unknown")
+        failures = payload.get("failure_summary", [])
+        entry = (
+            f"\n## {ts} | channel={channel} chat={chat_id}\n"
+            f"**Task**: {task}\n"
+            f"**Attempts**: {attempts}\n"
+            f"**Failures**:\n" + "".join(f"- {f}\n" for f in failures) +
+            f"**Escalated to**: grok-code-fast-1\n"
+            f"---\n"
+        )
+        with log_path.open("a", encoding="utf-8") as f:
+            if log_path.stat().st_size == 0:
+                f.write("# ESCALATION-LOG.md\nTracks every ESCALATE_TO event — how often grok-4-1-fast-reasoning needs help.\n")
+            f.write(entry)
+        logger.info("Escalation logged: {}", task)
+
+    async def _run_escalation(
+        self,
+        payload: dict[str, Any],
+        channel: str,
+        chat_id: str,
+    ) -> str:
+        """Run a focused one-shot escalation loop with grok-code-fast-1."""
+        task = payload.get("task", "unknown task")
+        failures = payload.get("failure_summary", [])
+        snapshot = payload.get("workspace_snapshot", "")
+        failure_ctx = "\n".join(f"- {f}" for f in failures) if failures else "No details provided."
+
+        system = (
+            "You are a specialist execution agent. Your only job is to complete the task below.\n"
+            "Rules:\n"
+            "1. Use tools immediately. No planning monologue.\n"
+            "2. After every tool call, quote the raw result verbatim before continuing.\n"
+            "3. Verify success with a confirming tool call (ls, cat, crontab -l, etc.).\n"
+            "4. Report done only after verification. Show the raw verification output.\n\n"
+            f"Context: The main agent failed {payload.get('attempts', 3)} times.\n"
+            f"Previous failures:\n{failure_ctx}\n"
+            f"Workspace notes: {snapshot}\n"
+        )
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Complete this task: {task}"},
+        ]
+        ESCALATION_MODEL = "grok-code-fast-1"
+        iteration = 0
+        max_iter = 15
+
+        while iteration < max_iter:
+            iteration += 1
+            response = await self.provider.chat(
+                messages=messages,
+                tools=self.tools.get_definitions(),
+                model=ESCALATION_MODEL,
+                temperature=0.2,
+                max_tokens=4096,
+            )
+            if response.has_tool_calls:
+                tool_call_dicts = [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.name,
+                                  "arguments": json.dumps(tc.arguments, ensure_ascii=False)}}
+                    for tc in response.tool_calls
+                ]
+                messages = self.context.add_assistant_message(
+                    messages, response.content, tool_call_dicts,
+                )
+                for tool_call in response.tool_calls:
+                    logger.info("[escalation] Tool call: {}({})", tool_call.name,
+                                json.dumps(tool_call.arguments)[:100])
+                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    if tool_call.name in STATE_CHANGING_TOOLS:
+                        result = (f"{result}\n\n[VERIFY] Quote this result verbatim before reporting done.")
+                    messages = self.context.add_tool_result(
+                        messages, tool_call.id, tool_call.name, result
+                    )
+            else:
+                content = self._strip_think(response.content) or "Escalation agent completed."
+                logger.info("[escalation] grok-code-fast-1 done: {}", content[:120])
+                return content
+
+        return "Escalation agent reached max iterations without completing the task."
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -436,6 +530,29 @@ class AgentLoop:
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
+
+        # Escalation catcher: detect ESCALATE_TO:{json} in model output
+        if final_content and "ESCALATE_TO:" in final_content:
+            try:
+                idx = final_content.index("ESCALATE_TO:") + len("ESCALATE_TO:")
+                raw = final_content[idx:].strip()
+                # Handle JSON on same line or next line
+                json_str = raw.split("\n")[0].strip().rstrip("`")
+                payload = json.loads(json_str)
+            except (ValueError, json.JSONDecodeError) as e:
+                logger.warning("ESCALATE_TO parse failed: {}", e)
+                payload = {"task": final_content[:200], "attempts": 3, "failure_summary": []}
+
+            logger.info("[escalation] Triggered for task: {}", payload.get("task", "?"))
+            await self._log_escalation(payload, channel=msg.channel, chat_id=msg.chat_id)
+
+            esc_result = await self._run_escalation(
+                payload, channel=msg.channel, chat_id=msg.chat_id
+            )
+            final_content = (
+                f"**Escalated to grok-code-fast-1** after {payload.get('attempts', 3)} attempts.\n\n"
+                f"{esc_result}"
+            )
 
         # Persist response_id for stateful continuation on next turn
         if final_response_id:
