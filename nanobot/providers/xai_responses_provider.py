@@ -35,10 +35,12 @@ class XAIResponsesProvider(LLMProvider):
         api_key: str,
         default_model: str = "grok-4-1-fast",
         store_messages: bool = True,
+        include_reasoning: bool = False,
     ) -> None:
         super().__init__(api_key=api_key, api_base=self.API_BASE)
         self.default_model = default_model
         self.store_messages = store_messages
+        self.include_reasoning = include_reasoning
         self._headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -56,6 +58,7 @@ class XAIResponsesProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         previous_response_id: str | None = None,
+        include_reasoning: bool | None = None,
     ) -> LLMResponse:
         """
         Send a request to /v1/responses.
@@ -74,26 +77,16 @@ class XAIResponsesProvider(LLMProvider):
         if previous_response_id and is_first_call and not has_tool_results:
             # Cross-turn continuation: server has everything up to last response.
             # Only send the new user message.
-            input_items = [
-                self._translate_message(m)
-                for m in messages
-                if m.get("role") == "user"
-            ][-1:]
+            input_items = [self._translate_message(m) for m in messages if m.get("role") == "user"][
+                -1:
+            ]
         elif previous_response_id and has_tool_results and not is_first_call:
             # Within-turn tool continuation: server has assistant tool-call message.
             # Only send tool result items.
-            input_items = [
-                self._translate_message(m)
-                for m in messages
-                if m.get("role") == "tool"
-            ]
+            input_items = [self._translate_message(m) for m in messages if m.get("role") == "tool"]
         else:
             # Full context: first turn ever, or fallback after expiry.
-            input_items = [
-                self._translate_message(m)
-                for m in messages
-                if self._keep_message(m)
-            ]
+            input_items = [self._translate_message(m) for m in messages if self._keep_message(m)]
 
         payload: dict[str, Any] = {
             "model": model or self.default_model,
@@ -106,9 +99,11 @@ class XAIResponsesProvider(LLMProvider):
             payload["previous_response_id"] = previous_response_id
         if tools:
             payload["tools"] = self._translate_tools(tools)
+        if include_reasoning or self.include_reasoning:
+            payload["include"] = ["reasoning.encrypted_content"]
 
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            async with httpx.AsyncClient(timeout=300) as client:
                 r = await client.post(
                     f"{self.API_BASE}/responses",
                     headers=self._headers,
@@ -129,7 +124,9 @@ class XAIResponsesProvider(LLMProvider):
                     temperature=temperature,
                     previous_response_id=None,  # full rebuild
                 )
-            return LLMResponse(content=f"xAI API error {e.response.status_code}: {body}", finish_reason="error")
+            return LLMResponse(
+                content=f"xAI API error {e.response.status_code}: {body}", finish_reason="error"
+            )
         except Exception as e:
             return LLMResponse(content=f"Error: {e}", finish_reason="error")
 
@@ -145,6 +142,7 @@ class XAIResponsesProvider(LLMProvider):
         output = data.get("output", [])
         content: str | None = None
         tool_calls: list[ToolCallRequest] = []
+        reasoning_content: str | None = None
 
         for item in output:
             item_type = item.get("type")
@@ -165,11 +163,16 @@ class XAIResponsesProvider(LLMProvider):
                     args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                 except (json.JSONDecodeError, ValueError):
                     args = {}
-                tool_calls.append(ToolCallRequest(
-                    id=item.get("call_id", item.get("id", "")),
-                    name=item.get("name", ""),
-                    arguments=args,
-                ))
+                tool_calls.append(
+                    ToolCallRequest(
+                        id=item.get("call_id", item.get("id", "")),
+                        name=item.get("name", ""),
+                        arguments=args,
+                    )
+                )
+
+            elif item_type == "reasoning":
+                reasoning_content = item.get("encrypted_content")
 
         # Determine finish reason
         if tool_calls:
@@ -192,6 +195,7 @@ class XAIResponsesProvider(LLMProvider):
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=usage,
+            reasoning_content=reasoning_content,
             response_id=data.get("id"),
         )
 
@@ -256,10 +260,12 @@ class XAIResponsesProvider(LLMProvider):
             if tool.get("type") != "function":
                 continue
             fn = tool.get("function", {})
-            translated.append({
-                "type": "function",
-                "name": fn.get("name", ""),
-                "description": fn.get("description", ""),
-                "parameters": fn.get("parameters", {}),
-            })
+            translated.append(
+                {
+                    "type": "function",
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                }
+            )
         return translated
